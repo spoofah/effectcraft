@@ -109,6 +109,10 @@ impl EffectHost for FxHost<'_, '_, '_> {
         self.r.read(|| self.r.footage.audio(item, f, st, frames, rate))
     }
 
+    fn comp_time_of(&self, layer_time: f64) -> Option<f64> {
+        layer_time.is_finite().then(|| self.layer.comp_time(Tick::from_seconds_f64(layer_time)).seconds())
+    }
+
     fn self_at(&self, layer_time: f64, effects: usize) -> Option<Buf> {
         if self.r.depth > MAX_FX_DEPTH || self.layer.switches.adjustment {
             return None;
@@ -141,8 +145,12 @@ impl EffectHost for FxHost<'_, '_, '_> {
                 Ok(())
             }
         }
+        fn has_prop(g: &effectcraft_project::PropGroup, uid: u64) -> bool {
+            g.props().any(|p| p.uid == uid) || g.groups().any(|s| has_prop(s, uid))
+        }
         let g = self.layer.effects()?.groups().nth(self.index)?;
-        if any_expression(g) {
+        // (an Essential Property override of a precomp instance changes values `g` doesn't hold)
+        if any_expression(g) || self.ctx.property_overrides.iter().any(|o| o.layer == self.layer.id && has_prop(g, o.prop)) {
             return None;
         }
         let mut h = Feed(std::collections::hash_map::DefaultHasher::new());

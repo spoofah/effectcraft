@@ -663,6 +663,13 @@ fn param_value<'p>(params: &'p Params, p: &PluginParam) -> Option<&'p Value> {
     params.get(&param_key(p)).or_else(|| params.get(&p.id))
 }
 
+/// The key `p` is stored under in `params`, as [`param_value`] reads it: its group path, or the
+/// bare id of an instance saved before the parameter was grouped (and not upgraded yet).
+fn stored_key(params: &Params, p: &PluginParam) -> String {
+    let key = param_key(p);
+    if params.get(&key).is_none() && params.get(&p.id).is_some() { p.id.clone() } else { key.into_owned() }
+}
+
 fn param_spec(p: &PluginParam) -> ParamSpec {
     let (default, ui) = match &p.kind {
         PluginParamKind::Slider { default, min, max, slider_min, slider_max, decimals, integer } => (
@@ -854,6 +861,13 @@ impl RenderHost<'_, '_> {
     fn grid(&self) -> Buf {
         Buf { img: crate::Image { width: self.width, height: self.height, data: vec![] }, offset: self.offset, scale: self.scale }
     }
+
+    /// The comp time of layer time `t`: through the layer's stretch where the host knows it,
+    /// else the same distance from the current time.
+    fn comp_time(&self, t: f64) -> Option<f64> {
+        let ctx = self.ctx;
+        Some(ctx.env.host?.comp_time_of(t).unwrap_or(ctx.env.comp_time + (t - ctx.time)))
+    }
 }
 
 impl PluginHost for RenderHost<'_, '_> {
@@ -865,7 +879,7 @@ impl PluginHost for RenderHost<'_, '_> {
     fn layer_input(&self, param_id: &str, layer_time: f64) -> Option<PluginImage> {
         let ctx = self.ctx;
         // The plug-in names its own parameter id; a grouped parameter is stored under its key.
-        let key = self.manifest.params.iter().find(|p| p.id == param_id).map(param_key)?;
+        let key = self.manifest.params.iter().find(|p| p.id == param_id).map(|p| stored_key(ctx.params, p))?;
         let param_id: &str = &key;
         let lid = ctx.params.get(param_id)?.as_layer()?;
         let other = if (layer_time - ctx.time).abs() < 1e-9 {
@@ -874,7 +888,7 @@ impl PluginHost for RenderHost<'_, '_> {
             let host = ctx.env.host?;
             // Source / Masks show no effects; the default (Effects & Masks) does.
             let with_effects = !matches!(ctx.params.get(&crate::layer_source_id(param_id)).map(Value::as_enum), Some(0 | 1));
-            host.layer_at(lid, ctx.env.comp_time + (layer_time - ctx.time), with_effects)?
+            host.layer_at(lid, self.comp_time(layer_time)?, with_effects)?
         };
         let img = crate::util::fit_layer(ctx, &self.grid(), &other, false);
         Some(PluginImage { width: img.width, height: img.height, pixels: img.data, origin: self.offset, scale: self.scale })
@@ -888,20 +902,20 @@ impl PluginHost for RenderHost<'_, '_> {
 
     fn comp_lights(&self, layer_time: f64) -> Option<Vec<CompLightInfo>> {
         let ctx = self.ctx;
-        Some(ctx.env.host?.comp_lights(ctx.env.comp_time + (layer_time - ctx.time)))
+        Some(ctx.env.host?.comp_lights(self.comp_time(layer_time)?))
     }
 
     fn comp_camera_at(&self, layer_time: f64) -> Option<CompCamera> {
         let ctx = self.ctx;
-        let sc = ctx.env.host?.comp_scene_at(ctx.env.comp_time + (layer_time - ctx.time))?;
+        let sc = ctx.env.host?.comp_scene_at(self.comp_time(layer_time)?)?;
         Some(CompCamera { matrix: sc.camera?, zoom: sc.zoom, camera_layer: sc.camera_layer, dof: sc.dof }).filter(|c| c.zoom > 0.0)
     }
 
     fn layer_transform(&self, param_id: &str, layer_time: f64) -> Option<LayerTransform> {
         let ctx = self.ctx;
-        let key = self.manifest.params.iter().find(|p| p.id == param_id).map(param_key)?;
+        let key = self.manifest.params.iter().find(|p| p.id == param_id).map(|p| stored_key(ctx.params, p))?;
         let lid = ctx.params.get(&key)?.as_layer()?;
-        let x = ctx.env.host?.layer_transform(lid, ctx.env.comp_time + (layer_time - ctx.time))?;
+        let x = ctx.env.host?.layer_transform(lid, self.comp_time(layer_time)?)?;
         // An image point u (buffer grid) is effect-space p = (u - origin) / scale of this layer,
         // the other layer's effect-space q = p + d with d its centring offset (`fit_layer`).
         let inv = 1.0 / self.scale.max(1e-9);
@@ -1014,14 +1028,34 @@ fn clear_outside(img: &mut crate::Image, b: [u32; 4]) {
 /// its place.
 fn crop(buf: Buf, b: [u32; 4]) -> Buf {
     let (x0, y0, x1, y1) = clamp_rect(b, buf.img.width, buf.img.height);
-    let (w, h) = ((x1 - x0).max(1), (y1 - y0).max(1));
+    // The cut starts on the buffer's pixel grid (whole `GRID_ALIGN` steps), which a downscaled
+    // layer resamples along; the pixels between it and `b` stay transparent.
+    let g = crate::GRID_ALIGN as usize;
+    let (cx, cy) = if x0 < x1 && y0 < y1 { (x0 - x0 % g, y0 - y0 % g) } else { (x0, y0) };
+    let (w, h) = ((x1 - cx).max(1), (y1 - cy).max(1));
     let mut img = crate::Image::new(w as u32, h as u32);
     if x0 < x1 && y0 < y1 {
         let sw = buf.img.width as usize;
-        for (y, row) in img.data.chunks_mut(w).enumerate() {
+        for (y, row) in img.data.chunks_mut(w).skip(y0 - cy).enumerate() {
             let s = (y0 + y) * sw + x0;
-            row.copy_from_slice(&buf.img.data[s..s + w]);
+            row[x0 - cx..x1 - cx].copy_from_slice(&buf.img.data[s..s + (x1 - x0)]);
         }
     }
-    Buf { img, offset: [buf.offset[0] - x0 as f64, buf.offset[1] - y0 as f64], scale: buf.scale }
+    Buf { img, offset: [buf.offset[0] - cx as f64, buf.offset[1] - cy as f64], scale: buf.scale }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grouped parameter is found under its group path, or under its bare id in an instance
+    /// saved before it was grouped.
+    #[test]
+    fn stored_key_falls_back_to_the_bare_id() {
+        let p = PluginParam { id: "floor".into(), name: "Floor".into(), kind: PluginParamKind::Layer, group: "Physics/Bounce".into() };
+        let with = |k: &str| Params { values: [(k.to_string(), Value::Scalar(1.0))].into_iter().collect() };
+        assert_eq!(stored_key(&with("Physics/Bounce/floor"), &p), "Physics/Bounce/floor");
+        assert_eq!(stored_key(&with("floor"), &p), "floor");
+        assert_eq!(stored_key(&with("other"), &p), "Physics/Bounce/floor");
+    }
 }
