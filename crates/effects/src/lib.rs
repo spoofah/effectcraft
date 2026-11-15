@@ -917,7 +917,7 @@ pub fn instantiate(spec: &EffectSpec, ids: &mut Ids, instance_name: &str, layer_
         if matches!(ps.ui, ParamUi::Checkbox | ParamUi::Popup { .. } | ParamUi::Layer) {
             pr.hold_only = true;
         }
-        match path.and_then(|path| nested_group(&mut g, ids, path)) {
+        match path.and_then(|path| nested_group(spec, &mut g, ids, path)) {
             Some(sub) => sub.children.push(pr.into()),
             None => g.children.push(pr.into()),
         }
@@ -929,7 +929,7 @@ pub fn instantiate(spec: &EffectSpec, ids: &mut Ids, instance_name: &str, layer_
         if matches!(ps.ui, ParamUi::Layer) && !spec.params.iter().any(|q| q.id == sid) {
             let mut src = Property::new(ids.alloc(), &layer_source_id(leaf), &format!("{} Source", ps.name), Value::Enum(2)).with_ui(ParamUi::Hidden);
             src.hold_only = true;
-            match path.and_then(|path| nested_group(&mut g, ids, path)) {
+            match path.and_then(|path| nested_group(spec, &mut g, ids, path)) {
                 Some(sub) => sub.children.push(src.into()),
                 None => g.children.push(src.into()),
             }
@@ -1126,8 +1126,12 @@ pub const PARAM_GROUPS: &[(&str, &str)] = &[
     ("strokeOptions", "Stroke Options"),
 ];
 
-/// Display names of nested parameter groups by match id.
-fn group_name(m: &str) -> &str {
+/// Display name of nested parameter group `m` of `spec`: a plug-in's own (from its manifest),
+/// else by match id from the tables.
+fn group_name(spec: &EffectSpec, m: &str) -> String {
+    if let Some(n) = plugin::group_display_name(spec.id, m) {
+        return n;
+    }
     warp_stab::GROUPS
         .iter()
         .chain(roto::GROUPS)
@@ -1135,22 +1139,22 @@ fn group_name(m: &str) -> &str {
         .chain(keylight::GROUPS)
         .chain(PARAM_GROUPS)
         .find(|(id, _)| *id == m)
-        .map(|(_, n)| *n)
-        .unwrap_or(m)
+        .map_or(m, |(_, n)| *n)
+        .to_string()
 }
 
 /// The nested group at `path` (`borders/autoScale`) under `g`, created on first use.
-fn nested_group<'a>(g: &'a mut PropGroup, ids: &mut Ids, path: &str) -> Option<&'a mut PropGroup> {
+fn nested_group<'a>(spec: &EffectSpec, g: &'a mut PropGroup, ids: &mut Ids, path: &str) -> Option<&'a mut PropGroup> {
     let (first, rest) = match path.split_once('/') {
         Some((a, b)) => (a, Some(b)),
         None => (path, None),
     };
     if g.sub(first).is_none() {
-        g.children.push(ids.group(first, group_name(first)).into());
+        g.children.push(ids.group(first, &group_name(spec, first)).into());
     }
     let sub = g.sub_mut(first)?;
     match rest {
-        Some(r) => nested_group(sub, ids, r),
+        Some(r) => nested_group(spec, sub, ids, r),
         None => Some(sub),
     }
 }
